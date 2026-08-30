@@ -297,6 +297,9 @@ impl OctavePerlinNoiseSampler {
     #[inline]
     #[must_use]
     pub const fn maintain_precision(value: f64) -> f64 {
+        if value >= -16_777_216.0 && value < 16_777_216.0 {
+            return value;
+        }
         value - (value / 3.355_443_2E7 + 0.5).floor() * 3.355_443_2E7
     }
 
@@ -483,6 +486,26 @@ mod tests {
         random::{RandomImpl, legacy_rand::LegacyRand, xoroshiro128::Xoroshiro},
         read_data_from_file,
     };
+
+    #[test]
+    fn maintain_precision_skips_values_that_do_not_wrap() {
+        assert_eq!(
+            OctavePerlinNoiseSampler::maintain_precision(-16_777_216.0),
+            -16_777_216.0
+        );
+        assert_eq!(
+            OctavePerlinNoiseSampler::maintain_precision(16_777_215.0),
+            16_777_215.0
+        );
+        assert_eq!(
+            OctavePerlinNoiseSampler::maintain_precision(16_777_216.0),
+            -16_777_216.0
+        );
+        assert_eq!(
+            OctavePerlinNoiseSampler::maintain_precision(-16_777_217.0),
+            16_777_215.0
+        );
+    }
 
     #[test]
     fn create_xoroshiro() {
