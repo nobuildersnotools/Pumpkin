@@ -7280,7 +7280,20 @@ fn bedrock_block_breaking_rate(speed: f32) -> i32 {
     (speed.clamp(0.0, 1.0) * f32::from(u16::MAX)) as i32
 }
 
-pub struct WorldPortal(pub Arc<World>);
+pub struct WorldPortal {
+    world: Weak<World>,
+    block_registry: Arc<BlockRegistry>,
+}
+
+impl WorldPortal {
+    #[must_use]
+    pub fn new(world: &Arc<World>) -> Self {
+        Self {
+            world: Arc::downgrade(world),
+            block_registry: world.block_registry.clone(),
+        }
+    }
+}
 
 // Pure Beauty :cap:
 impl WorldPortalExt for WorldPortal {
@@ -7291,7 +7304,7 @@ impl WorldPortalExt for WorldPortal {
         block_accessor: &dyn BlockAccessor,
         block_pos: &BlockPos,
     ) -> bool {
-        self.0.block_registry.can_place_at(
+        self.block_registry.can_place_at(
             None,
             None,
             block_accessor,
@@ -7305,7 +7318,7 @@ impl WorldPortalExt for WorldPortal {
     }
 
     fn mirror(&self, block: &Block, state_id: BlockStateId, mirror: Mirror) -> &'static BlockState {
-        self.0.block_registry.mirror(block, state_id, mirror)
+        self.block_registry.mirror(block, state_id, mirror)
     }
 
     fn rotate(
@@ -7314,7 +7327,7 @@ impl WorldPortalExt for WorldPortal {
         state_id: BlockStateId,
         rotation: Rotation,
     ) -> &'static BlockState {
-        self.0.block_registry.rotate(block, state_id, rotation)
+        self.block_registry.rotate(block, state_id, rotation)
     }
 
     fn spawn_mobs_for_chunk_generation(
@@ -7324,10 +7337,17 @@ impl WorldPortalExt for WorldPortal {
         chunk_x: i32,
         chunk_z: i32,
     ) {
-        natural_spawner::spawn_mobs_for_chunk_generation(&self.0, cache, biome, chunk_x, chunk_z);
+        if let Some(world) = self.world.upgrade() {
+            natural_spawner::spawn_mobs_for_chunk_generation(
+                &world, cache, biome, chunk_x, chunk_z,
+            );
+        }
     }
 
     fn spawn_structure_entities(&self, entities: Vec<NbtCompound>) {
+        let Some(world) = self.world.upgrade() else {
+            return;
+        };
         for nbt in entities {
             let Some(id) = nbt.get_string("id") else {
                 continue;
@@ -7341,12 +7361,12 @@ impl WorldPortalExt for WorldPortal {
             let entity = from_type(
                 entity_type,
                 Vector3::new(0.0, 0.0, 0.0),
-                &self.0,
+                &world,
                 Uuid::new_v4(),
             );
             entity.get_entity().read_nbt_non_mut(&nbt);
             entity.read_nbt_non_mut(&nbt);
-            self.0.spawn_entity(entity);
+            world.spawn_entity(entity);
         }
     }
 }
@@ -7420,3 +7440,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lifetime_tests;
