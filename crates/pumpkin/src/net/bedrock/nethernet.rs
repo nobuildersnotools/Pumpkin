@@ -1098,26 +1098,127 @@ mod tests {
             Some(&vec![3; 65536]),
             "unacknowledged payload was lost"
         );
-        for _ in 0..client.outgoing_packet_queue_send.capacity() {
-            client.try_enqueue_packet_data(Bytes::new());
+        assert_eq!(
+            client.pending_bytes.load(Ordering::Relaxed),
+            response.data.len(),
+            "queued blob response must reserve its payload bytes"
+        );
+        crate::net::decrement_pending_bytes(&client.pending_bytes, response.data.len());
+        assert_eq!(client.pending_bytes.load(Ordering::Relaxed), 0);
+        client.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_status_keeps_payloads_when_enqueue_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use pumpkin_protocol::bedrock::server::client_cache_blob_status::SClientCacheBlobStatus;
+
+        enum Failure {
+            ClosedQueue,
+            BufferOverflow,
+            ClosedClient,
         }
+
+        for failure in [
+            Failure::ClosedQueue,
+            Failure::BufferOverflow,
+            Failure::ClosedClient,
+        ] {
+            let client = blob_test_client().await?;
+            let mut outgoing = client
+                .outgoing_packet_queue_recv
+                .lock()
+                .await
+                .take()
+                .ok_or("missing queue")?;
+            let pending_bytes = match failure {
+                Failure::BufferOverflow => crate::net::MAX_PENDING_BYTES,
+                Failure::ClosedQueue | Failure::ClosedClient => 123,
+            };
+            client.pending_bytes.store(pending_bytes, Ordering::Relaxed);
+            client
+                .blob_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend([(1, vec![1]), (2, vec![2])]);
+            match failure {
+                Failure::ClosedQueue => outgoing.close(),
+                Failure::BufferOverflow => {}
+                Failure::ClosedClient => client.close().await,
+            }
+
+            client.handle_client_cache_blob_status(SClientCacheBlobStatus {
+                hit_hashes: vec![1],
+                miss_hashes: vec![2],
+            });
+
+            assert!(outgoing.try_recv().is_err(), "failed response was queued");
+            assert_eq!(
+                client.pending_bytes.load(Ordering::Relaxed),
+                pending_bytes,
+                "failed response must not retain a byte reservation"
+            );
+            let cache = client
+                .blob_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            assert!(
+                !cache.contains_key(&1),
+                "acknowledged payload remains cached"
+            );
+            assert_eq!(cache.get(&2), Some(&vec![2]), "unsent payload was lost");
+            if matches!(failure, Failure::BufferOverflow) {
+                assert!(client.is_closed(), "buffer overflow must close the client");
+            }
+            client.close().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blob_status_retries_after_encoder_is_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use pumpkin_protocol::bedrock::server::client_cache_blob_status::SClientCacheBlobStatus;
+
+        let client = blob_test_client().await?;
+        let mut outgoing = client
+            .outgoing_packet_queue_recv
+            .lock()
+            .await
+            .take()
+            .ok_or("missing queue")?;
+        client
+            .blob_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(1, vec![1]);
+        let encoder = client.network_writer.write().await;
         client.handle_client_cache_blob_status(SClientCacheBlobStatus {
             hit_hashes: vec![],
-            miss_hashes: vec![1001],
+            miss_hashes: vec![1],
         });
+        drop(encoder);
+        assert!(outgoing.try_recv().is_err());
+        assert_eq!(client.pending_bytes.load(Ordering::Relaxed), 0);
         assert!(
             client
                 .blob_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&1001),
-            "a full queue must not lose the only copy of a missing blob"
+                .contains_key(&1)
         );
-        let _ = outgoing.try_recv()?;
+
         client.handle_client_cache_blob_status(SClientCacheBlobStatus {
             hit_hashes: vec![],
-            miss_hashes: vec![1001],
+            miss_hashes: vec![1],
         });
+        let response = outgoing.try_recv()?;
+        assert_eq!(
+            client.pending_bytes.load(Ordering::Relaxed),
+            response.data.len()
+        );
         assert!(
             client
                 .blob_cache
